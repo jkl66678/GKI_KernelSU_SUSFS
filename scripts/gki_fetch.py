@@ -11,7 +11,6 @@ from datetime import datetime
 
 REPO_URL = "https://android.googlesource.com/kernel/common"
 BASE_URL = f"{REPO_URL}/+/refs/heads"
-# gitiles 的 refs 列表接口，一次拿到全部分支名 / tag 名
 REFS_URL = f"{REPO_URL}/+refs"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -19,7 +18,6 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
 # (android版本, 内核版本): (起始日期, 结束日期, deprecated截止日期)
-# 结束日期为 None 表示活跃版本，运行时自动使用当前月份
 TARGETS = {
     ("android12", "5.10"): ("2021-08", "2025-12", "2024-08"),
     ("android13", "5.15"): ("2022-06", "2025-12", "2024-09"),
@@ -40,7 +38,6 @@ ERRORS = (
 
 
 def get_end_date(end: str | None) -> str:
-    """返回结束日期：如果为 None 则使用当前月份"""
     if end is not None:
         return end
     return datetime.now().strftime("%Y-%m")
@@ -51,15 +48,14 @@ def make_date_range(start: str, end: str) -> list[str]:
     生成从 start 到 end 的日期列表。
 
     GKI 从 2025 年下半年起将 android14-6.1 等分支的发布节奏从月度改为季度，
-    仅 3、6、9、12 月有对应的分支。因此只生成季度月份，并额外保留起始月份
-    （起始月份可能不是季度月份，但它是该目标的首个有效分支）。
+    仅 3、6、9、12 月有对应分支。只生成季度月份，并保留起始月份
+    （起始月份可能不是季度月，但它是该目标的首个有效分支）。
     """
     sy, sm = map(int, start.split("-"))
     ey, em = map(int, end.split("-"))
     dates = []
     y, m = sy, sm
     while (y, m) <= (ey, em):
-        # 保留起始月份，或仅保留季度月份（3、6、9、12）
         if (y, m) == (sy, sm) or m in (3, 6, 9, 12):
             dates.append(f"{y}-{m:02d}")
         m += 1
@@ -70,7 +66,6 @@ def make_date_range(start: str, end: str) -> list[str]:
 
 
 def try_fetch(url: str) -> str | None:
-    """尝试请求一个 URL，失败返回 None"""
     try:
         with urllib.request.urlopen(url, timeout=20) as resp:
             return base64.b64decode(resp.read()).decode("utf-8", errors="replace")
@@ -79,10 +74,7 @@ def try_fetch(url: str) -> str | None:
 
 
 def fetch_refs() -> tuple[set[str], set[str]] | None:
-    """
-    一次性获取上游全部分支名与 tag 名（不含 refs/heads、refs/tags 前缀），
-    失败返回 None
-    """
+    """一次性获取上游全部分支名与 tag 名，失败返回 None"""
     result = []
     for kind in ("heads", "tags"):
         url = f"{REFS_URL}/{kind}?format=JSON"
@@ -91,7 +83,6 @@ def fetch_refs() -> tuple[set[str], set[str]] | None:
                 raw = resp.read().decode("utf-8", errors="replace")
         except ERRORS:
             return None
-        # gitiles 的 JSON 响应前面带一行防 XSSI 前缀
         if raw.startswith(")]}'"):
             raw = raw.split("\n", 1)[1]
         try:
@@ -103,11 +94,11 @@ def fetch_refs() -> tuple[set[str], set[str]] | None:
 
 def resolve_ref(branch: str, heads: set[str], tags: set[str]) -> str | None:
     """
-    按 build.yml 的规则解析月度分支在上游的实际位置：
-      活跃分支  -> refs/heads/
-      已迁移    -> refs/heads/deprecated/
-      已删除    -> refs/tags/_rN（编号最大的发布 tag）
-      都没有    -> None
+    按 build.yml 的规则解析分支在上游的实际位置：
+      活跃分支 -> refs/heads/
+      已迁移   -> refs/heads/deprecated/
+      已删除   -> refs/tags/_rN（编号最大的发布 tag）
+      都没有   -> None
     """
     if branch in heads:
         return f"refs/heads/{branch}"
@@ -124,6 +115,32 @@ def resolve_ref(branch: str, heads: set[str], tags: set[str]) -> str | None:
     return f"refs/tags/{best}" if best else None
 
 
+def fetch_branch_makefile(branch: str, dep_cutoff: str) -> str | None:
+    """
+    无 refs 时的回退路径：先按 dep_cutoff 猜活跃 / deprecated 路径，
+    都失败则查一次 tag 列表做最后回退。只在 fetch_refs() 失败时用到。
+    """
+    if dep_cutoff and branch.rsplit("-", 1)[-1] <= dep_cutoff:
+        paths = [f"deprecated/{branch}", branch]
+    else:
+        paths = [branch, f"deprecated/{branch}"]
+
+    for p in paths:
+        text = try_fetch(f"{BASE_URL}/{p}/Makefile?format=TEXT")
+        if text is not None:
+            return text
+        time.sleep(0.3)
+
+    # 路径都失败：分支可能已被上游删除，只剩发布 tag
+    refs = fetch_refs()
+    if refs is None:
+        return None
+    ref = resolve_ref(branch, *refs)
+    if ref is None:
+        return None
+    return try_fetch(f"{REPO_URL}/+/{ref}/Makefile?format=TEXT")
+
+
 def fetch_makefile(
     android_ver: str,
     kernel_ver: str,
@@ -131,11 +148,7 @@ def fetch_makefile(
     dep_cutoff: str,
     refs: tuple[set[str], set[str]] | None = None,
 ) -> str | None:
-    """
-    获取日期分支 Makefile。
-    提供 refs 时直接按上游实际位置取（含分支已删除时的发布 tag）；
-    否则退回逐个路径试探：优先预期路径，失败再回退。
-    """
+    """获取日期分支的 Makefile。有 refs 时直接按上游实际位置取，否则走回退路径。"""
     branch = f"{android_ver}-{kernel_ver}-{date}"
 
     if refs is not None:
@@ -144,18 +157,7 @@ def fetch_makefile(
             return None
         return try_fetch(f"{REPO_URL}/+/{ref}/Makefile?format=TEXT")
 
-    if dep_cutoff and date <= dep_cutoff:
-        paths = [f"deprecated/{branch}", branch]
-    else:
-        paths = [branch, f"deprecated/{branch}"]
-
-    for p in paths:
-        url = f"{BASE_URL}/{p}/Makefile?format=TEXT"
-        text = try_fetch(url)
-        if text is not None:
-            return text
-        time.sleep(0.3)
-    return None
+    return fetch_branch_makefile(branch, dep_cutoff)
 
 
 def refresh_refs(
@@ -164,10 +166,7 @@ def refresh_refs(
     kernel_ver: str,
     refs: tuple[set[str], set[str]],
 ) -> int:
-    """
-    为每条记录写入 / 更新 ref 字段（上游实际路径），返回变更条数。
-    分支会随时间从活跃迁到 deprecated/ 再被删除，因此每次运行都要全量刷新。
-    """
+    """为每条记录写入 / 更新 ref 字段（上游实际路径），返回变更条数。"""
     heads, tags = refs
     changed = 0
     for entry in entries:
@@ -184,14 +183,11 @@ def refresh_refs(
 
 
 def fetch_lts(android_ver: str, kernel_ver: str) -> str | None:
-    """获取 LTS 分支 Makefile"""
     lts_branch = f"{android_ver}-{kernel_ver}-lts"
-    url = f"{BASE_URL}/{lts_branch}/Makefile?format=TEXT"
-    return try_fetch(url)
+    return try_fetch(f"{BASE_URL}/{lts_branch}/Makefile?format=TEXT")
 
 
 def parse_version(makefile_text: str) -> tuple[str, str, str] | None:
-    """从 Makefile 提取 VERSION, PATCHLEVEL, SUBLEVEL"""
     vals = {}
     for key in ("VERSION", "PATCHLEVEL", "SUBLEVEL"):
         m = re.search(rf"^{key}\s*=\s*(\d+)", makefile_text, re.MULTILINE)
@@ -202,5 +198,4 @@ def parse_version(makefile_text: str) -> tuple[str, str, str] | None:
 
 
 def json_path(android_ver: str, kernel_ver: str) -> str:
-    """返回对应的 JSON 文件路径"""
     return os.path.join(DATA_DIR, android_ver, f"{kernel_ver}.json")

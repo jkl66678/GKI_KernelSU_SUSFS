@@ -2,6 +2,9 @@
 
 读取现有 JSON 数据，仅抓取缺失的月份，同时更新 LTS 版本，
 并按上游实际位置（活跃 / deprecated/ / 发布 tag）刷新每条记录的 ref 字段。
+
+只抓取近 2 年的月份：update_target 会用 get_recent_start(24) 动态修正起始日期。
+已存在的历史条目不会被删除，只会刷新 ref。
 """
 
 import json
@@ -10,7 +13,7 @@ import time
 
 from gki_fetch import (
     TARGETS, DATA_DIR,
-    make_date_range, get_end_date,
+    make_date_range, get_end_date, get_recent_start,
     fetch_makefile, fetch_lts, fetch_refs, refresh_refs,
     parse_version, json_path,
 )
@@ -21,6 +24,10 @@ def update_target(android_ver: str, kernel_ver: str,
                   dep_cutoff: str,
                   refs: tuple[set[str], set[str]] | None = None) -> bool:
     """增量更新单个目标，返回是否有数据变更"""
+    # 只抓近 2 年：起始日期取 TARGETS 中的值与近 2 年起点中较晚者
+    recent_start = get_recent_start(24)
+    date_start = max(date_start, recent_start)
+
     path = json_path(android_ver, kernel_ver)
     end = get_end_date(date_end)
     changed = False
@@ -43,7 +50,7 @@ def update_target(android_ver: str, kernel_ver: str,
         }
         entries = []
 
-    # 扫描完整日期范围并排除已有月份，以补齐历史缺失数据
+    # 扫描近 2 年范围并排除已有月份，以补齐缺失数据。
     existing_dates = {e["date"] for e in entries}
     all_dates = make_date_range(date_start, end)
     new_dates = [d for d in all_dates if d not in existing_dates]
@@ -75,7 +82,7 @@ def update_target(android_ver: str, kernel_ver: str,
 
     entries.sort(key=lambda e: e["date"])
 
-    # 上游位置会随时间变化（活跃 -> deprecated/ -> 仅剩 tag），每次全量刷新
+    # 上游位置会随时间变化（活跃 -> deprecated/ -> 仅剩 tag），每次全量刷新。
     if refs is not None:
         ref_changes = refresh_refs(entries, android_ver, kernel_ver, refs)
         if ref_changes:
@@ -118,7 +125,6 @@ def main():
     any_changed = False
     refs = fetch_refs()
     if refs is None:
-        # refs 接口偶尔失败时不中断整次更新，只跳过 ref 刷新
         print("WARNING: failed to fetch upstream refs, ref fields will not be refreshed this run")
     else:
         print(f"Fetched upstream refs: {len(refs[0])} heads, {len(refs[1])} tags")

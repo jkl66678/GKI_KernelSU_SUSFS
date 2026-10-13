@@ -6,12 +6,14 @@ import time
 import http.client
 import urllib.request
 import urllib.error
+import binascii
 from datetime import datetime
 
 REPO_URL = "https://android.googlesource.com/kernel/common"
 BASE_URL = f"{REPO_URL}/+/refs/heads"
 # gitiles 的 refs 列表接口，一次拿到全部分支名 / tag 名
 REFS_URL = f"{REPO_URL}/+refs"
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
@@ -21,16 +23,20 @@ DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 TARGETS = {
     ("android12", "5.10"): ("2021-08", "2025-12", "2024-08"),
     ("android13", "5.15"): ("2022-06", "2025-12", "2024-09"),
-    ("android14", "6.1"):  ("2023-06", None,       "2024-09"),
-    ("android15", "6.6"):  ("2024-10", None,       ""),
-    ("android16", "6.12"): ("2025-06", None,       ""),
+    ("android14", "6.1"): ("2023-06", None, "2024-09"),
+    ("android15", "6.6"): ("2024-10", None, ""),
+    ("android16", "6.12"): ("2025-06", None, ""),
 }
 
-import binascii
-
-ERRORS = (urllib.error.HTTPError, urllib.error.URLError,
-          TimeoutError, http.client.RemoteDisconnected,
-          ConnectionResetError, OSError, binascii.Error)
+ERRORS = (
+    urllib.error.HTTPError,
+    urllib.error.URLError,
+    TimeoutError,
+    http.client.RemoteDisconnected,
+    ConnectionResetError,
+    OSError,
+    binascii.Error,
+)
 
 
 def get_end_date(end: str | None) -> str:
@@ -41,13 +47,21 @@ def get_end_date(end: str | None) -> str:
 
 
 def make_date_range(start: str, end: str) -> list[str]:
-    """生成从 start 到 end 的 YYYY-MM 列表"""
+    """
+    生成从 start 到 end 的日期列表。
+
+    GKI 从 2025 年下半年起将 android14-6.1 等分支的发布节奏从月度改为季度，
+    仅 3、6、9、12 月有对应的分支。因此只生成季度月份，并额外保留起始月份
+    （起始月份可能不是季度月份，但它是该目标的首个有效分支）。
+    """
     sy, sm = map(int, start.split("-"))
     ey, em = map(int, end.split("-"))
     dates = []
     y, m = sy, sm
     while (y, m) <= (ey, em):
-        dates.append(f"{y}-{m:02d}")
+        # 保留起始月份，或仅保留季度月份（3、6、9、12）
+        if (y, m) == (sy, sm) or m in (3, 6, 9, 12):
+            dates.append(f"{y}-{m:02d}")
         m += 1
         if m > 12:
             m = 1
@@ -65,7 +79,10 @@ def try_fetch(url: str) -> str | None:
 
 
 def fetch_refs() -> tuple[set[str], set[str]] | None:
-    """一次性获取上游全部分支名与 tag 名（不含 refs/heads、refs/tags 前缀），失败返回 None"""
+    """
+    一次性获取上游全部分支名与 tag 名（不含 refs/heads、refs/tags 前缀），
+    失败返回 None
+    """
     result = []
     for kind in ("heads", "tags"):
         url = f"{REFS_URL}/{kind}?format=JSON"
@@ -85,16 +102,18 @@ def fetch_refs() -> tuple[set[str], set[str]] | None:
 
 
 def resolve_ref(branch: str, heads: set[str], tags: set[str]) -> str | None:
-    """按 build.yml 的规则解析月度分支在上游的实际位置：
-    活跃分支 -> refs/heads/<branch>
-    已迁移   -> refs/heads/deprecated/<branch>
-    已删除   -> refs/tags/<branch>_rN（编号最大的发布 tag）
-    都没有   -> None
+    """
+    按 build.yml 的规则解析月度分支在上游的实际位置：
+      活跃分支  -> refs/heads/
+      已迁移    -> refs/heads/deprecated/
+      已删除    -> refs/tags/_rN（编号最大的发布 tag）
+      都没有    -> None
     """
     if branch in heads:
         return f"refs/heads/{branch}"
     if f"deprecated/{branch}" in heads:
         return f"refs/heads/deprecated/{branch}"
+
     prefix = f"{branch}_r"
     best, best_n = None, -1
     for tag in tags:
@@ -105,11 +124,15 @@ def resolve_ref(branch: str, heads: set[str], tags: set[str]) -> str | None:
     return f"refs/tags/{best}" if best else None
 
 
-def fetch_makefile(android_ver: str, kernel_ver: str, date: str,
-                   dep_cutoff: str,
-                   refs: tuple[set[str], set[str]] | None = None) -> str | None:
-    """获取日期分支 Makefile。
-
+def fetch_makefile(
+    android_ver: str,
+    kernel_ver: str,
+    date: str,
+    dep_cutoff: str,
+    refs: tuple[set[str], set[str]] | None = None,
+) -> str | None:
+    """
+    获取日期分支 Makefile。
     提供 refs 时直接按上游实际位置取（含分支已删除时的发布 tag）；
     否则退回逐个路径试探：优先预期路径，失败再回退。
     """
@@ -135,10 +158,14 @@ def fetch_makefile(android_ver: str, kernel_ver: str, date: str,
     return None
 
 
-def refresh_refs(entries: list[dict], android_ver: str, kernel_ver: str,
-                 refs: tuple[set[str], set[str]]) -> int:
-    """为每条记录写入 / 更新 ref 字段（上游实际路径），返回变更条数。
-
+def refresh_refs(
+    entries: list[dict],
+    android_ver: str,
+    kernel_ver: str,
+    refs: tuple[set[str], set[str]],
+) -> int:
+    """
+    为每条记录写入 / 更新 ref 字段（上游实际路径），返回变更条数。
     分支会随时间从活跃迁到 deprecated/ 再被删除，因此每次运行都要全量刷新。
     """
     heads, tags = refs

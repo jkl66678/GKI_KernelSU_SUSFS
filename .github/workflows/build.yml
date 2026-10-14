@@ -1090,7 +1090,7 @@ jobs:
           echo "=== NTSync 补丁与配置注入完成 ==="
 
       - name: 应用 Unicode 绕过修复
-        if: inputs.enable_susfs
+        if: inputs.use_networking
         working-directory: ${{ env.KERNEL_ROOT }}/common
         run: |
           # 上游 2023-11、2024-01、2024-03 月度分支已带有 "unicode: Don't special case ignorable code points"，
